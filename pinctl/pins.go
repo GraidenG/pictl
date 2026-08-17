@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/warthog618/go-gpiocdev"
@@ -28,13 +29,13 @@ type pin struct {
 // output pin type
 type outputPin struct {
 	pin
-	mu sync.Mutex
+	mu sync.Mutex // mostly used to prevent duplicate requests via TryLock since it is imitating a physical button
 }
 
 // input pin type
 type inputPin struct {
 	pin
-	currentStatus bool
+	currentStatus atomic.Bool // atomic because it will be accessed by multiple goroutines, but shouldn't block any (i.e. the HTTP api reading this just needs a value, it doesn't need to be blocked by an incoming update)
 }
 
 // the pins that are used
@@ -46,6 +47,7 @@ var (
 
 // can be identified using errors.Is, even if wrapped in another error
 var (
+	// Returned when a button is already pressed (mutex lock active) and another press is attempted
 	ErrButtonAlreadyPressed = errors.New("button is already pressed")
 )
 
@@ -59,6 +61,7 @@ func (p *outputPin) ShortPress() error {
 	return p.press(500 * time.Millisecond)
 }
 
+// Button press functionality utilizing a mutex to ensure conflicts don't occur (since it is trying to imitate a physical button, conflicts don't make sense)
 func (p *outputPin) press(duration time.Duration) error {
 	if success := p.mu.TryLock(); !success {
 		return fmt.Errorf("%s: %w", p.name, ErrButtonAlreadyPressed)
@@ -87,11 +90,14 @@ func (p *outputPin) setHigh() error {
 	return nil
 }
 
+// Try to set the pin low, if this fails it is critical that it does not get stuck high and the error handling will go as
+// far as crashing the program to ensure it gets closed (and set to input by the kernel when reclaimed)
 func (p *outputPin) setLow() error {
 	err := p.line.SetValue(0)
 	if err != nil {
-		if closeErr := p.closePin(); closeErr != nil {
+		if closeErr := p.closePin(); closeErr != nil && !errors.Is(closeErr, gpiocdev.ErrClosed) {
 			// give up and crash so the kernel sets the pin low
+			// Note: this is skipped if the error was that the line was already closed
 			log.Fatalf("setting %s pin low: %v (fatal: %v)", p.name, err, closeErr)
 		}
 		return fmt.Errorf("setting %s pin low: %w", p.name, err)
@@ -100,22 +106,49 @@ func (p *outputPin) setLow() error {
 }
 
 func (p *inputPin) GetStatus() bool {
-	return p.currentStatus
+	return p.currentStatus.Load()
+}
+
+func (p *inputPin) UpdateStatus() error {
+	val, err := p.line.Value()
+	if err != nil {
+		return err
+	}
+
+	booleanValue := !(val == 0)
+	p.currentStatus.Store(booleanValue)
+	return nil
+}
+
+// handle edge detection for input pins using logical active levels
+func (p *inputPin) handleEdge(evt gpiocdev.LineEvent) {
+	if evt.Type == gpiocdev.LineEventFallingEdge {
+		p.currentStatus.Store(false)
+	} else {
+		p.currentStatus.Store(true)
+	}
 }
 
 // Initialize requests every Line in layout with the corresponding config and adds to the Pins map.
 // In the case of failure, it will make an effort to close any that were opened
 func Initialize() error {
 	var err error
+	// init power switch as output low
 	if PowerSwitch.pin, err = requestPin("power_switch", pwrPin, gpiocdev.AsOutput(0)); err != nil {
 		return err
 	}
 
+	// init reset switch as output low
 	if ResetSwitch.pin, err = requestPin("reset_switch", rstPin, gpiocdev.AsOutput(0)); err != nil {
 		return err
 	}
 
-	if PowerLED.pin, err = requestPin("power_led", ledPin, gpiocdev.AsInput, gpiocdev.WithPullUp); err != nil {
+	// init powerLED input as input, active low (inverted, connected to ground = high since that represents the LED), internal pull up resistor enabled, and edge detection
+	if PowerLED.pin, err = requestPin("power_led", ledPin, gpiocdev.AsInput, gpiocdev.AsActiveLow, gpiocdev.WithPullUp, gpiocdev.WithBothEdges, gpiocdev.WithEventHandler(PowerLED.handleEdge)); err != nil {
+		return err
+	}
+	err = PowerLED.UpdateStatus()
+	if err != nil {
 		return err
 	}
 
@@ -143,7 +176,7 @@ func CloseAll() error {
 	var errs []error
 	var failed []pin
 	for _, p := range pins {
-		if err := p.closePin(); err != nil {
+		if err := p.closePin(); err != nil && !errors.Is(err, gpiocdev.ErrClosed) {
 			errs = append(errs, err)
 			failed = append(failed, p) // keep track of pins that failed to close
 		}
