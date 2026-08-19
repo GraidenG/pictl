@@ -17,7 +17,7 @@ const (
 func main() {
 	// initialize pinctl
 	if err := pinctl.Initialize(); err != nil {
-		fmt.Printf("pin initialization: %w", err)
+		fmt.Printf("pin initialization: %v\n", err)
 		os.Exit(1)
 	}
 
