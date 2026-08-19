@@ -32,7 +32,9 @@ func GetHandler() http.Handler {
 	mux.HandleFunc("GET /api/status", handleStatus)
 	mux.HandleFunc("POST /api/power/short", handlePowerShort)
 	mux.HandleFunc("POST /api/power/long", handlePowerLong)
+	mux.HandleFunc("POST /api/power/cancel", handlePowerCancel)
 	mux.HandleFunc("POST /api/reset", handleReset)
+	mux.HandleFunc("POST /api/reset/cancel", handleResetCancel)
 
 	// the operator page, embedded so the binary is self-contained
 	page, err := fs.Sub(webFS, "web")
@@ -158,6 +160,14 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 	press(w, pinctl.ResetSwitch.ShortPress)
 }
 
+func handlePowerCancel(w http.ResponseWriter, r *http.Request) {
+	cancel(w, pinctl.PowerSwitch.CancelPress)
+}
+
+func handleResetCancel(w http.ResponseWriter, r *http.Request) {
+	cancel(w, pinctl.ResetSwitch.CancelPress)
+}
+
 // press runs do and maps the result onto a status code. It blocks for the full
 // press duration, and does not watch r.Context(): a client disconnecting must
 // not abandon a press half-done, or the line stays high.
@@ -170,5 +180,24 @@ func press(w http.ResponseWriter, do func() error) {
 		http.Error(w, "already pressed", http.StatusConflict)
 	default:
 		http.Error(w, "press failed", http.StatusInternalServerError)
+	}
+}
+
+// cancel shortens an in-flight press. It returns as soon as the cancel is
+// signalled, not when the line actually goes low -- the press goroutine owns
+// that, and still runs setLow on its way out.
+//
+// Cancelling when nothing is pressed is a conflict, not a failure: it means the
+// press finished on its own between the operator deciding to stop it and the
+// request landing. The client is expected to treat 409 as a non-event.
+func cancel(w http.ResponseWriter, do func() error) {
+	err := do()
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, pinctl.ErrNoPressToCancel):
+		http.Error(w, "no press to cancel", http.StatusConflict)
+	default:
+		http.Error(w, "cancel failed", http.StatusInternalServerError)
 	}
 }

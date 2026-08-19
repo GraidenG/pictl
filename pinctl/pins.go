@@ -38,6 +38,9 @@ type pin struct {
 type outputPin struct {
 	pin
 	mu sync.Mutex // mostly used to prevent duplicate requests via TryLock since it is imitating a physical button
+
+	pressCtxCancel context.CancelFunc // allows cancelling of a button press
+	cancelMu       sync.Mutex         // since cancel needs to be accessed by multiple goroutines
 }
 
 // input pin type
@@ -57,6 +60,7 @@ var (
 var (
 	// Returned when a button is already pressed (mutex lock active) and another press is attempted
 	ErrButtonAlreadyPressed = errors.New("button is already pressed")
+	ErrNoPressToCancel      = errors.New("no press to cancel")
 )
 
 // long button press, i.e. simulate holding the button down
@@ -69,6 +73,19 @@ func (p *outputPin) ShortPress() error {
 	return p.press(ShortPressDuration)
 }
 
+// cancels an existing press or returns ErrNoPressToCancel if there is no active press on that pin
+func (p *outputPin) CancelPress() error {
+	p.cancelMu.Lock()
+	defer p.cancelMu.Unlock()
+	if p.pressCtxCancel != nil {
+		p.pressCtxCancel()
+	} else {
+		return ErrNoPressToCancel
+	}
+
+	return nil
+}
+
 // Button press functionality utilizing a mutex to ensure conflicts don't occur (since it is trying to imitate a physical button, conflicts don't make sense)
 func (p *outputPin) press(duration time.Duration) error {
 	if success := p.mu.TryLock(); !success {
@@ -76,13 +93,35 @@ func (p *outputPin) press(duration time.Duration) error {
 	}
 	defer p.mu.Unlock()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // release the context's resources on every exit path
+
+	// set cancel func on struct so it can be used to cancel the press early later
+	p.cancelMu.Lock()
+	p.pressCtxCancel = cancel
+	p.cancelMu.Unlock()
+
+	// defer setting the cancel context back to nil
+	defer func() {
+		p.cancelMu.Lock()
+		p.pressCtxCancel = nil
+		p.cancelMu.Unlock()
+	}()
+
 	err := p.setHigh()
 	if err != nil {
 		// as far as I can tell there's no situation where setHigh can return an error while still having succeeded.
 		return err
 	}
 
-	time.Sleep(duration)
+	// wait for duration or until context is canceled (button press cancel)
+	select {
+	case <-ctx.Done():
+		break
+	case <-time.After(duration):
+		break
+	}
+
 	err = p.setLow()
 	if err != nil {
 		return err

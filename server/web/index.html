@@ -8,7 +8,7 @@
   :root {
     --bg: #16181d; --panel: #1e2128; --line: #2c313b;
     --text: #e4e7ec; --dim: #8b93a1;
-    --on: #3fb950; --off: #6e7681; --bad: #f85149; --accent: #4d8ff0;
+    --on: #3fb950; --off: #6e7681; --bad: #f85149; --accent: #4d8ff0; --warn: #d29922;
   }
   * { box-sizing: border-box; }
   body {
@@ -42,7 +42,10 @@
     background: color-mix(in srgb, var(--accent) 22%, transparent);
     pointer-events: none;
   }
-  button.pressing .fill { width: 100%; transition: width linear; }
+  button.arming .fill, button.pressing .fill { width: 100%; transition: width linear; }
+  button.arming .fill { background: color-mix(in srgb, var(--warn) 22%, transparent); }
+  button.arming { border-color: var(--warn); }
+  button.pressing { border-color: var(--accent); }
   button .dur { float: right; color: var(--dim); font-size: .8rem; }
 
   #err { color: var(--bad); font-size: .8rem; min-height: 1.4em; margin: 0; }
@@ -77,6 +80,11 @@ const STREAM_TIMEOUT_MS = 3000;
 // Delay before reconnecting, so a server that is down does not get hammered.
 const STREAM_RETRY_MS = 1000;
 
+// Grace period between clicking an action and the request going out. Nothing
+// has been sent to the server during this window, so aborting is purely local
+// and cannot leave a line high.
+const COUNTDOWN_MS = 3000;
+
 // The server has no endpoint that describes itself, so the buttons are listed
 // here. They must stay in step with the routes in server.go, and ms must match
 // pinctl.ShortPressDuration / LongPressDuration -- it only sizes the fill
@@ -84,11 +92,12 @@ const STREAM_RETRY_MS = 1000;
 //
 // group names the pin behind the action. A press is exclusive per pin, so the
 // whole group is disabled during one: asking the server for a second press on
-// the same line just earns a 409.
+// the same line just earns a 409. cancelPath is per pin for the same reason --
+// both power actions cancel through the same route.
 const ACTIONS = [
-  {label: 'Power',        path: 'api/power/short', ms: 500,  group: 'power'},
-  {label: 'Power (hold)', path: 'api/power/long',  ms: 6000, group: 'power'},
-  {label: 'Reset',        path: 'api/reset',       ms: 500,  group: 'reset'},
+  {label: 'Power',        path: 'api/power/short', cancelPath: 'api/power/cancel', ms: 500,  group: 'power'},
+  {label: 'Power (hold)', path: 'api/power/long',  cancelPath: 'api/power/cancel', ms: 6000, group: 'power'},
+  {label: 'Reset',        path: 'api/reset',       cancelPath: 'api/reset/cancel', ms: 500,  group: 'reset'},
 ];
 
 const errEl = document.getElementById('err');
@@ -97,6 +106,8 @@ function showError(msg) { errEl.textContent = msg || ''; }
 // --- actions ---------------------------------------------------------------
 
 const groups = new Map(); // group name -> buttons sharing that pin
+
+function fmtMs(ms) { return ms >= 1000 ? `${ms / 1000}s` : `${ms}ms`; }
 
 function renderActions() {
   const host = document.getElementById('actions');
@@ -107,27 +118,97 @@ function renderActions() {
     label.textContent = action.label;
     const dur = document.createElement('span');
     dur.className = 'dur';
-    dur.textContent = action.ms >= 1000 ? `${action.ms / 1000}s` : `${action.ms}ms`;
+    dur.textContent = fmtMs(action.ms);
     btn.append(label, dur);
-    btn.addEventListener('click', () => run(action, btn));
     host.append(btn);
+
+    const ui = {action, btn, label, dur, fill: btn.querySelector('.fill'), phase: 'idle', timer: null};
+    btn.addEventListener('click', () => onClick(ui));
 
     if (!groups.has(action.group)) groups.set(action.group, []);
     groups.get(action.group).push(btn);
   }
 }
 
-// The awaited fetch is the source of truth for when the action ends -- the
-// server responds when the press actually completes. The fill animation is
-// cosmetic only.
-async function run(action, btn) {
-  showError('');
-  const siblings = groups.get(action.group);
-  for (const b of siblings) b.disabled = true;
+// One button, three meanings, because at every point there is exactly one thing
+// the operator could want: start it, call it off before it leaves, or cut it
+// short once it is running.
+function onClick(ui) {
+  if (ui.phase === 'arming') disarm(ui);
+  else if (ui.phase === 'pressing') sendCancel(ui);
+  else arm(ui);
+}
 
-  const fill = btn.querySelector('.fill');
-  fill.style.transitionDuration = action.ms + 'ms';
-  btn.classList.add('pressing');
+// Siblings share a pin, so they are dead for the whole cycle. The clicked
+// button stays live -- it is the cancel control.
+function lockGroup(ui, locked) {
+  for (const b of groups.get(ui.action.group)) {
+    if (b !== ui.btn) b.disabled = locked;
+  }
+}
+
+// Restart the fill from zero over ms. The reflow is required: without it the
+// browser coalesces the reset and the new width into no transition at all.
+function runFill(ui, ms, cls) {
+  ui.btn.classList.remove('arming', 'pressing');
+  ui.fill.style.transitionDuration = '0ms';
+  ui.fill.style.width = '';
+  void ui.fill.offsetWidth;
+  ui.fill.style.transitionDuration = ms + 'ms';
+  ui.btn.classList.add(cls);
+}
+
+function reset(ui) {
+  ui.phase = 'idle';
+  ui.btn.classList.remove('arming', 'pressing');
+  ui.fill.style.transitionDuration = '0ms';
+  ui.fill.style.width = '';
+  ui.label.textContent = ui.action.label;
+  ui.dur.textContent = fmtMs(ui.action.ms);
+  ui.btn.disabled = false;
+  lockGroup(ui, false);
+}
+
+// Count down locally before committing. Nothing is sent until it reaches zero.
+function arm(ui) {
+  showError('');
+  ui.phase = 'arming';
+  ui.label.textContent = 'Cancel ' + ui.action.label;
+  lockGroup(ui, true);
+  runFill(ui, COUNTDOWN_MS, 'arming');
+
+  const deadline = performance.now() + COUNTDOWN_MS;
+  const tick = () => {
+    const left = deadline - performance.now();
+    if (left <= 0) {
+      clearInterval(ui.timer);
+      ui.timer = null;
+      fire(ui);
+      return;
+    }
+    ui.dur.textContent = Math.ceil(left / 1000) + 's';
+  };
+  tick();
+  ui.timer = setInterval(tick, 100);
+}
+
+// Called off before the request went out, so there is nothing to tell the
+// server about.
+function disarm(ui) {
+  clearInterval(ui.timer);
+  ui.timer = null;
+  reset(ui);
+}
+
+// The awaited fetch is the source of truth for when the action ends -- the
+// server responds when the press actually completes, early cancel included.
+// The fill animation is cosmetic only.
+async function fire(ui) {
+  const {action} = ui;
+  ui.phase = 'pressing';
+  ui.label.textContent = 'Cancel ' + action.label;
+  ui.dur.textContent = fmtMs(action.ms);
+  runFill(ui, action.ms, 'pressing');
 
   try {
     const res = await fetch(action.path, {
@@ -144,10 +225,29 @@ async function run(action, btn) {
     // server regardless of this connection. The status panel is ground truth.
     showError(action.label + ': no response (check status)');
   } finally {
-    btn.classList.remove('pressing');
-    fill.style.transitionDuration = '0ms';
-    fill.style.width = '';
-    for (const b of siblings) b.disabled = false;
+    reset(ui);
+  }
+}
+
+// Cut an in-flight press short. This only signals the server; the press request
+// from fire() is what reports the outcome and clears the button, so nothing is
+// reset here.
+async function sendCancel(ui) {
+  const {action} = ui;
+  ui.btn.disabled = true; // one cancel is enough; fire()'s reset re-enables it
+  try {
+    const res = await fetch(action.cancelPath, {
+      method: 'POST',
+      signal: AbortSignal.timeout(5000),
+    });
+    // 409 means the press ended on its own just before this landed -- that is
+    // the outcome the operator asked for, so it is not worth reporting.
+    if (!res.ok && res.status !== 409) {
+      const body = (await res.text().catch(() => '')).trim();
+      showError(action.label + ' cancel: ' + (body || res.status));
+    }
+  } catch {
+    showError(action.label + ' cancel: no response (check status)');
   }
 }
 
