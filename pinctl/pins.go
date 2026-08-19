@@ -61,12 +61,12 @@ var (
 
 // long button press, i.e. simulate holding the button down
 func (p *outputPin) LongPress() error {
-	return p.press(6 * time.Second)
+	return p.press(LongPressDuration)
 }
 
 // short button press, i.e. simulate a single press of the button
 func (p *outputPin) ShortPress() error {
-	return p.press(500 * time.Millisecond)
+	return p.press(ShortPressDuration)
 }
 
 // Button press functionality utilizing a mutex to ensure conflicts don't occur (since it is trying to imitate a physical button, conflicts don't make sense)

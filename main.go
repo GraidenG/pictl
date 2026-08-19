@@ -1,23 +1,43 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"os"
+	"log"
 	"pictl/pinctl"
+	"pictl/server"
+	"time"
 )
 
-// Initialize HTTP API server and goroutines
+const (
+	socketPath = "/home/indigo/pictl.sock"
+)
+
 func main() {
-	err := pinctl.Initialize()
-	if err != nil {
-		fmt.Printf("pin initialization error: %v\n", err)
-		os.Exit(1)
+	// initialize pinctl
+	if err := pinctl.Initialize(); err != nil {
+		fmt.Printf("pin initialization: %w", err)
 	}
 
-	fmt.Println("Pins initialized")
+	ledSyncCtx, cancel := context.WithCancel(context.Background())
+	// the LED status is updated by edge events, it probably won't get desynced, but this makes certain
+	go pinctl.PowerLED.SyncValue(ledSyncCtx, 30*time.Second)
+	defer cancel() // pretty sure this doesn't matter
 
-	err = pinctl.CloseAll()
+	handler := server.GetHandler()
+	listener, err := server.GetUnixListener(socketPath)
 	if err != nil {
-		fmt.Printf("pin close error: %v\n", err)
+		_ = pinctl.CloseAll()
+		log.Fatalf("initializing unix socket %s: %v", socketPath, err)
 	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- server.Run(context.Background(), listener, handler) }()
+
+	err = <-runErr
+	if err != nil {
+		log.Fatalf("server exited: %v", err)
+	}
+
+	_ = pinctl.CloseAll()
 }
