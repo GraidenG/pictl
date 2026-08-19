@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"pictl/pinctl"
 	"pictl/server"
 	"time"
@@ -17,6 +18,7 @@ func main() {
 	// initialize pinctl
 	if err := pinctl.Initialize(); err != nil {
 		fmt.Printf("pin initialization: %w", err)
+		os.Exit(1)
 	}
 
 	ledSyncCtx, cancel := context.WithCancel(context.Background())
