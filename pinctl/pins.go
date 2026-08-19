@@ -1,6 +1,7 @@
 package pinctl
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -18,6 +19,13 @@ const (
 	ledPin   = rpi.GPIO22
 	gpiochip = "gpiochip0" // the device name from linux
 	consumer = "pictl"     // identifier for pin ownership
+)
+
+// How long each kind of press holds the line high. Exported so callers can
+// report the duration to a UI without duplicating the number.
+const (
+	ShortPressDuration = 500 * time.Millisecond
+	LongPressDuration  = 6 * time.Second
 )
 
 // generic pin type
@@ -120,7 +128,32 @@ func (p *inputPin) UpdateStatus() error {
 	return nil
 }
 
-// handle edge detection for input pins using logical active levels
+// SyncValue prevents desyncs of the inputPin's currentStatus boolean that are definitely unlikely, but I don't think are impossible
+func (p *inputPin) SyncValue(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// if the context is over, return
+			return
+		case <-ticker.C:
+			// every tick, update the value to current
+			err := p.UpdateStatus()
+			if err != nil {
+				log.Printf("updating %s pin status: %v", p.name, err)
+			}
+		}
+	}
+
+}
+
+// handle edge detection for input pins using logical active level
+// The way these are read ensures that while some events may be dropped from the buffer
+// if they are not read, the newest event will always be present. So ultimately, it will
+// always end up correct but may miss intermediate events (this can be detected using
+// sequence numbers if needed).
 func (p *inputPin) handleEdge(evt gpiocdev.LineEvent) {
 	if evt.Type == gpiocdev.LineEventFallingEdge {
 		p.currentStatus.Store(false)

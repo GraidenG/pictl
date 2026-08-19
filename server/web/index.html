@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pictl</title>
+<style>
+  :root {
+    --bg: #16181d; --panel: #1e2128; --line: #2c313b;
+    --text: #e4e7ec; --dim: #8b93a1;
+    --on: #3fb950; --off: #6e7681; --bad: #f85149; --accent: #4d8ff0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1rem;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; justify-content: center;
+  }
+  main { width: 100%; max-width: 26rem; }
+  h1 { font-size: 1rem; font-weight: 600; margin: 0 0 1.5rem; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  h2 { font-size: .75rem; font-weight: 600; margin: 0 0 .75rem; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
+
+  .sensor { display: flex; align-items: center; gap: .6rem; padding: .25rem 0; }
+  .dot { width: .7rem; height: .7rem; border-radius: 50%; background: var(--off); flex: none; transition: background .15s; }
+  .dot.on { background: var(--on); box-shadow: 0 0 8px color-mix(in srgb, var(--on) 60%, transparent); }
+  .dot.unknown { background: var(--bad); }
+  .sensor .val { margin-left: auto; color: var(--dim); font-size: .8rem; }
+
+  .actions { display: flex; flex-direction: column; gap: .5rem; }
+  button {
+    position: relative; overflow: hidden;
+    font: inherit; color: var(--text); text-align: left;
+    background: #262a33; border: 1px solid var(--line); border-radius: 6px;
+    padding: .6rem .8rem; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { cursor: default; color: var(--dim); }
+  button .fill {
+    position: absolute; inset: 0 auto 0 0; width: 0;
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    pointer-events: none;
+  }
+  button.pressing .fill { width: 100%; transition: width linear; }
+  button .dur { float: right; color: var(--dim); font-size: .8rem; }
+
+  #err { color: var(--bad); font-size: .8rem; min-height: 1.4em; margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>pictl</h1>
+
+  <section>
+    <h2>Status</h2>
+    <div class="sensor">
+      <span class="dot unknown" id="led-dot"></span>
+      <span>Power LED</span>
+      <span class="val" id="led-val">?</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Actions</h2>
+    <div class="actions" id="actions"></div>
+  </section>
+
+  <p id="err"></p>
+</main>
+
+<script>
+// How long the stream may go quiet before it counts as dead. The server ticks
+// four times a second, so there is no legitimate pause to wait out.
+const STREAM_TIMEOUT_MS = 3000;
+
+// Delay before reconnecting, so a server that is down does not get hammered.
+const STREAM_RETRY_MS = 1000;
+
+// The server has no endpoint that describes itself, so the buttons are listed
+// here. They must stay in step with the routes in server.go, and ms must match
+// pinctl.ShortPressDuration / LongPressDuration -- it only sizes the fill
+// animation, but a wrong value makes the bar finish early or late.
+//
+// group names the pin behind the action. A press is exclusive per pin, so the
+// whole group is disabled during one: asking the server for a second press on
+// the same line just earns a 409.
+const ACTIONS = [
+  {label: 'Power',        path: 'api/power/short', ms: 500,  group: 'power'},
+  {label: 'Power (hold)', path: 'api/power/long',  ms: 6000, group: 'power'},
+  {label: 'Reset',        path: 'api/reset',       ms: 500,  group: 'reset'},
+];
+
+const errEl = document.getElementById('err');
+function showError(msg) { errEl.textContent = msg || ''; }
+
+// --- actions ---------------------------------------------------------------
+
+const groups = new Map(); // group name -> buttons sharing that pin
+
+function renderActions() {
+  const host = document.getElementById('actions');
+  for (const action of ACTIONS) {
+    const btn = document.createElement('button');
+    btn.innerHTML = '<span class="fill"></span>';
+    const label = document.createElement('span');
+    label.textContent = action.label;
+    const dur = document.createElement('span');
+    dur.className = 'dur';
+    dur.textContent = action.ms >= 1000 ? `${action.ms / 1000}s` : `${action.ms}ms`;
+    btn.append(label, dur);
+    btn.addEventListener('click', () => run(action, btn));
+    host.append(btn);
+
+    if (!groups.has(action.group)) groups.set(action.group, []);
+    groups.get(action.group).push(btn);
+  }
+}
+
+// The awaited fetch is the source of truth for when the action ends -- the
+// server responds when the press actually completes. The fill animation is
+// cosmetic only.
+async function run(action, btn) {
+  showError('');
+  const siblings = groups.get(action.group);
+  for (const b of siblings) b.disabled = true;
+
+  const fill = btn.querySelector('.fill');
+  fill.style.transitionDuration = action.ms + 'ms';
+  btn.classList.add('pressing');
+
+  try {
+    const res = await fetch(action.path, {
+      method: 'POST',
+      signal: AbortSignal.timeout(action.ms + 15000),
+    });
+    // Errors come back from http.Error as plain text, not JSON.
+    if (!res.ok) {
+      const body = (await res.text().catch(() => '')).trim();
+      showError(action.label + ': ' + (body || res.status));
+    }
+  } catch {
+    // The press may well have completed anyway -- it runs to completion on the
+    // server regardless of this connection. The status panel is ground truth.
+    showError(action.label + ': no response (check status)');
+  } finally {
+    btn.classList.remove('pressing');
+    fill.style.transitionDuration = '0ms';
+    fill.style.width = '';
+    for (const b of siblings) b.disabled = false;
+  }
+}
+
+// --- status ----------------------------------------------------------------
+// The SSE stream at /api/events/status pushes a `status` event carrying
+// {"on": bool}. It is the only source: a dropped or stalled stream is replaced
+// with a fresh one rather than falling back to /api/status, so there is one
+// code path to reason about and the LED reading is never quietly stale.
+
+const dot = document.getElementById('led-dot');
+const val = document.getElementById('led-val');
+
+function showStatus(on) {
+  dot.className = 'dot' + (on ? ' on' : '');
+  val.textContent = on ? 'on' : 'off';
+}
+
+function showUnknown() {
+  dot.className = 'dot unknown';
+  val.textContent = '?';
+}
+
+let stream = null;
+let stallTimer = null;
+
+function startStream() {
+  stream = new EventSource('api/events/status');
+
+  stream.addEventListener('status', (e) => {
+    let on;
+    try {
+      ({on} = JSON.parse(e.data));
+    } catch {
+      return; // malformed frame; the stall timer will restart us if it persists
+    }
+    showStatus(on);
+    watchStream();
+  });
+
+  // EventSource dispatches both a server-sent `event: error` frame and a
+  // connection-level failure under the name "error". Only the former is a
+  // MessageEvent carrying data.
+  stream.addEventListener('error', (e) => {
+    if (typeof e.data === 'string') {
+      let msg = e.data;
+      try { msg = JSON.parse(e.data).error ?? msg; } catch {}
+      showError('status: ' + msg);
+      return;
+    }
+    restartStream();
+  });
+
+  watchStream();
+}
+
+// Restarted on every event received; if it fires, the stream stopped delivering
+// even though the connection may still look open.
+function watchStream() {
+  clearTimeout(stallTimer);
+  stallTimer = setTimeout(restartStream, STREAM_TIMEOUT_MS);
+}
+
+// EventSource retries on its own, but not after an HTTP error status, and never
+// for a stream that is open but silent. Owning the reconnect covers both.
+function restartStream() {
+  if (stream === null) return; // a restart is already pending
+  clearTimeout(stallTimer);
+  stream.close();
+  stream = null;
+  showUnknown();
+  setTimeout(startStream, STREAM_RETRY_MS);
+}
+
+renderActions();
+startStream();
+</script>
+</body>
+</html>
