@@ -10,9 +10,16 @@ import (
 	"time"
 )
 
-const (
-	socketPath = "/home/indigo/pictl.sock"
-)
+// Where the API socket lives. Overridable so the systemd unit can point it at its
+// RuntimeDirectory; the default matches deploy/pictl.service.
+const defaultSocketPath = "/run/pictl/pictl.sock"
+
+func socketPath() string {
+	if p := os.Getenv("PICTL_SOCKET"); p != "" {
+		return p
+	}
+	return defaultSocketPath
+}
 
 func main() {
 	// initialize pinctl
@@ -27,10 +34,11 @@ func main() {
 	defer cancel() // pretty sure this doesn't matter
 
 	handler := server.GetHandler()
-	listener, err := server.GetUnixListener(socketPath)
+	sock := socketPath()
+	listener, err := server.GetUnixListener(sock)
 	if err != nil {
 		_ = pinctl.CloseAll()
-		log.Fatalf("initializing unix socket %s: %v", socketPath, err)
+		log.Fatalf("initializing unix socket %s: %v", sock, err)
 	}
 
 	runErr := make(chan error, 1)
