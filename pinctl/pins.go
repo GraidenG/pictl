@@ -138,12 +138,20 @@ func (p *outputPin) setHigh() error {
 }
 
 // Try to set the pin low, if this fails it is critical that it does not get stuck high and the error handling will go as
-// far as crashing the program to ensure it gets closed (and set to input by the kernel when reclaimed)
+// far as crashing the program to ensure it gets closed.
+//
+// Per Claude (I did not verify this due to time constraints and it is such an extreme edge case that this would actually cause issues):
+// Releasing the line is what makes crashing safe: dying closes the line's fd whatever the cause
+// (SIGKILL, log.Fatalf), and on the Pi Zero's BCM2835 the pinctrl driver then reverts the pin to an
+// input, i.e. high impedance rather than low. The pad's pull is not reset on release, but pwrPin and
+// rstPin default to pull down, and the MOSFET has an external gate-to-ground resistor anyway. So the
+// program can crash or be killed mid-press without leaving the button held.
+// This means the program could crash, or be terminated mid-press safely.
 func (p *outputPin) setLow() error {
 	err := p.line.SetValue(0)
 	if err != nil {
 		if closeErr := p.closePin(); closeErr != nil && !errors.Is(closeErr, gpiocdev.ErrClosed) {
-			// give up and crash so the kernel sets the pin low
+			// give up and crash. Kernel driver reverts the pin to input
 			// Note: this is skipped if the error was that the line was already closed
 			log.Fatalf("setting %s pin low: %v (fatal: %v)", p.name, err, closeErr)
 		}

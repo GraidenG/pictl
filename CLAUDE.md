@@ -17,7 +17,7 @@ go vet ./...              # static checks — copylocks matters here, see Archit
 gofmt -l .                # should print nothing
 go test ./...             # no test files exist yet
 go test -run '^TestName$' ./pinctl/   # single test, once tests exist
-GOOS=linux GOARCH=arm GOARM=6 go build -o pictl .   # cross-compile for the Pi (32-bit ARM)
+GOOS=linux GOARCH=arm GOARM=6 go build -o pictl .   # cross-compile for the Pi Zero W (ARMv6, 32-bit)
 ```
 
 ## Running it
@@ -68,7 +68,7 @@ Invariants that are deliberate and easy to break accidentally:
   the full press duration — 500ms short, 6s long — so callers that must stay responsive need their
   own goroutine.
 - **Failing to release a pin is fatal on purpose.** If `setLow` fails, the code tries to close the
-  line so the kernel drives it low; if that also fails it calls `log.Fatalf`. Crashing is preferred
+  line so the kernel reclaims it; if that also fails it calls `log.Fatalf`. Crashing is preferred
   over leaving a power button virtually held down. Keep that escalation path intact when touching
   output handling.
 - **Cancelling shortens a press; it never skips the release.** `press` selects on `ctx.Done()` vs
@@ -79,6 +79,20 @@ Invariants that are deliberate and easy to break accidentally:
   instead of firing a cancel func whose press already finished. Dropping the defer makes the cancel
   endpoint report success while the machine sits idle, and `go vet`'s `lostcancel` will not catch it
   because the func escapes into a struct field.
+
+**What "released" means in hardware.** Neither closing the line nor crashing drives the pin low.
+Process death closes the request fd, which runs `gpiod_free_commit()` — it clears the bias, edge and
+active-low flags but never touches direction or value — and then the chip's `gpio_disable_free`. The
+target is a Pi Zero W, so that is `bcm2835_pmx_free()`, which reverts the pin to `GPIO_IN`: high
+impedance, not low. The gate-to-ground resistor on the switch circuit is what turns high-Z into "not
+pressed", which means the fatal-on-stuck-high escalation is only safe *because* of that resistor.
+Verified against v6.18 sources.
+
+Do not port this to a Pi 5 unchecked. Its RP1 pinctrl driver sets `persist_gpio_outputs = true` by
+default, so `rp1_pmx_free()` returns early and leaves a freed output still driving its last value —
+a crash mid-press would strand the power button held down. That board needs
+`pinctrl_rp1.persist_gpio_outputs=0` before this design holds. The BCM2835 equivalent already
+defaults to false and is `0444`, so there is nothing to set here.
 
 **Two mutexes, and the order matters.** `mu` is held for the entire press duration (up to 6s);
 `cancelMu` guards only the `pressCtxCancel` field. They cannot be merged: `CancelPress` runs from
