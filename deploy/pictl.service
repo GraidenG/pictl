@@ -1,0 +1,50 @@
+[Unit]
+Description=pictl front-panel GPIO control
+After=local-fs.target
+# Never stop retrying: a fresh start re-requests the switch pins as outputs driving
+# low, so restarting is what recovers the board from a crash mid-press.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/pictl
+Restart=always
+RestartSec=1
+
+User=pictl
+Group=pictl
+SupplementaryGroups=gpio
+
+# systemd creates/chowns/removes this; the socket lives inside it.
+RuntimeDirectory=pictl
+RuntimeDirectoryMode=0750
+Environment=PICTL_SOCKET=/run/pictl/pictl.sock
+
+# --- device access -----------------------------------------------------------
+# NOTE: do NOT add PrivateDevices=yes here. It replaces /dev with a minimal set
+# and would hide gpiochip0, breaking pinctl.Initialize.
+DevicePolicy=closed
+DeviceAllow=/dev/gpiochip0 rw
+
+# --- no network at all -------------------------------------------------------
+# The API is a unix socket, so the service never needs a network namespace.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+# --- filesystem --------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0007
+
+# --- resource bounds (512MB, single core) ------------------------------------
+MemoryHigh=32M
+MemoryMax=64M
+TasksMax=64
+
+SyslogIdentifier=pictl
+
+[Install]
+WantedBy=multi-user.target
