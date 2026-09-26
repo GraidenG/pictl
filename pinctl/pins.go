@@ -15,7 +15,7 @@ import (
 
 const (
 	pwrPin   = rpi.GPIO16
-	rstPin   = rpi.GPIO17
+	rstPin   = rpi.GPIO25
 	ledPin   = rpi.GPIO22
 	gpiochip = "gpiochip0" // the device name from linux
 	consumer = "pictl"     // identifier for pin ownership
